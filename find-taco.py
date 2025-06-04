@@ -26,7 +26,6 @@ OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 # 3) sqlite database where we store processed taco restaurants
 DB_PATH = "taco_restaurants.db"
-OFFSET_FILE = "last_offset.txt"  # file to store the last used offset
 
 # 4) search parameters
 LOCATION = "Austin, TX"
@@ -35,36 +34,6 @@ LIMIT_PER_PAGE = 50  # max yelp allows is 50
 
 
 # ─── HELPERS ────────────────────────────────────────────────────────────────────
-def get_last_offset() -> int:
-    """
-    read the last used offset from file.
-    returns 0 if file doesn't exist or can't be read.
-    """
-    try:
-        if os.path.exists(OFFSET_FILE):
-            with open(OFFSET_FILE, "r") as f:
-                return int(f.read().strip())
-        return 0
-    except Exception as e:
-        if DEBUG:
-            logging.debug(f"error reading last offset: {e}")
-        return 0
-
-
-def save_last_offset(offset: int):
-    """
-    save the current offset to file for next run.
-    """
-    try:
-        with open(OFFSET_FILE, "w") as f:
-            f.write(str(offset))
-        if DEBUG:
-            logging.debug(f"saved offset {offset} for next run")
-    except Exception as e:
-        if DEBUG:
-            logging.debug(f"error saving offset: {e}")
-
-
 def init_database(db_path: str):
     """
     initialize the sqlite database if it doesn't exist.
@@ -92,7 +61,16 @@ def init_database(db_path: str):
         text TEXT NOT NULL,
         rating REAL,
         date TEXT,
-        FOREIGN KEY (restaurant_id) REFERENCES taco_restaurants(id)
+        FOREIGN KEY (restaurant_id) REFERENCES taco_restaurants(id),
+        UNIQUE(text)
+    )
+    ''')
+
+    # create app_settings table for storing key-value pairs
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS app_settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
     )
     ''')
 
@@ -101,6 +79,68 @@ def init_database(db_path: str):
 
     if DEBUG:
         logging.debug(f"database initialized at: {db_path}")
+
+
+def get_setting(db_path: str, key: str, default_value: str = "") -> str:
+    """
+    get a setting value from the app_settings table.
+    returns the default value if the key doesn't exist.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT value FROM app_settings WHERE key = ?", (key,))
+        result = cursor.fetchone()
+        conn.close()
+
+        if result:
+            return result[0]
+        return default_value
+    except Exception as e:
+        if DEBUG:
+            logging.debug(f"error getting setting {key}: {e}")
+        return default_value
+
+
+def set_setting(db_path: str, key: str, value: str):
+    """
+    store a setting value in the app_settings table.
+    uses insert or replace to handle both new and existing keys.
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
+            (key, value)
+        )
+        conn.commit()
+        conn.close()
+
+        if DEBUG:
+            logging.debug(f"saved setting {key}={value}")
+    except Exception as e:
+        if DEBUG:
+            logging.debug(f"error saving setting {key}: {e}")
+
+
+def get_last_offset(db_path: str) -> int:
+    """
+    get the last used offset from the database.
+    returns 0 if not set.
+    """
+    try:
+        offset_str = get_setting(db_path, "last_offset", "0")
+        return int(offset_str)
+    except ValueError:
+        return 0
+
+
+def save_last_offset(db_path: str, offset: int):
+    """
+    save the current offset to the database for next run.
+    """
+    set_setting(db_path, "last_offset", str(offset))
 
 
 def load_existing_restaurants(db_path: str) -> set:
@@ -152,6 +192,7 @@ def insert_reviews(db_path: str, restaurant_id: str, reviews: list):
     """
     insert multiple review records into the database.
     reviews is a list of review objects from the yelp api.
+    uses insert or ignore to prevent duplicate reviews.
     """
     if not reviews:
         return
@@ -160,13 +201,49 @@ def insert_reviews(db_path: str, restaurant_id: str, reviews: list):
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
+        # check if we need to migrate the reviews table to add unique constraint
+        cursor.execute("PRAGMA table_info(reviews)")
+        columns = cursor.fetchall()
+        has_unique_constraint = False
+
+        # check if the table has a unique index on text only
+        cursor.execute("PRAGMA index_list(reviews)")
+        indexes = cursor.fetchall()
+        for idx in indexes:
+            cursor.execute(f"PRAGMA index_info({idx[1]})")
+            index_columns = cursor.fetchall()
+            # check if this index has the text column only
+            for col in index_columns:
+                col_name = columns[col[2]][1]
+                if col_name == 'text':
+                    has_unique_constraint = True
+                    break
+            if has_unique_constraint:
+                break
+
+        # if no unique constraint exists, create one
+        if not has_unique_constraint:
+            if DEBUG:
+                logging.debug("adding unique constraint to reviews table")
+            try:
+                # create a unique index on text only
+                cursor.execute('''
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_reviews_text
+                ON reviews(text)
+                ''')
+                conn.commit()
+            except Exception as e:
+                if DEBUG:
+                    logging.debug(f"error creating unique index: {e}")
+
+        # insert reviews using INSERT OR IGNORE to skip duplicates
         for review in reviews:
             text = review.get("text", "")
             rating = review.get("rating", None)
             time_created = review.get("time_created", None)
 
             cursor.execute('''
-            INSERT INTO reviews (restaurant_id, text, rating, date)
+            INSERT OR IGNORE INTO reviews (restaurant_id, text, rating, date)
             VALUES (?, ?, ?, ?)
             ''', (restaurant_id, text, rating, time_created))
 
@@ -519,7 +596,7 @@ def main():
     existing_ids = load_existing_restaurants(DB_PATH)
 
     # get the last used offset to start from there
-    offset = get_last_offset()
+    offset = get_last_offset(DB_PATH)
 
     if DEBUG:
         logging.debug(f"starting search for '{TERM}' in '{LOCATION}'")
@@ -583,11 +660,11 @@ def main():
         offset += LIMIT_PER_PAGE
 
         # save current offset for next run
-        save_last_offset(offset)
+        save_last_offset(DB_PATH, offset)
 
         # if we've reached the end, wrap around to 0 for next run
         if offset >= data.get("total", 0) or offset >= 1000:
-            save_last_offset(0)
+            save_last_offset(DB_PATH, 0)
             break
 
     # summary of processing

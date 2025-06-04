@@ -15,7 +15,7 @@ def get_reviews_for_restaurant(db_path: str, restaurant_id: str):
         return []
 
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         cursor = conn.cursor()
 
         cursor.execute("""
@@ -42,7 +42,7 @@ def view_all_restaurants(db_path: str):
         return
 
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         cursor = conn.cursor()
 
         # get total count
@@ -94,7 +94,7 @@ def view_restaurant_by_id(db_path: str, biz_id: str):
         return
 
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         cursor = conn.cursor()
 
         # fetch restaurant
@@ -146,6 +146,98 @@ def view_restaurant_by_id(db_path: str, biz_id: str):
     except Exception as e:
         print(f"error reading database: {e}")
 
+def display_stats(db_path: str):
+    """
+    display statistics about restaurants and reviews in the database.
+    shows counts, popular tacos, and zip code distribution.
+    """
+
+    if not os.path.isfile(db_path):
+        print(f"database file not found: {db_path}")
+        return
+
+    try:
+        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        cursor = conn.cursor()
+
+        # get restaurant count
+        cursor.execute("SELECT COUNT(*) FROM taco_restaurants")
+        restaurant_count = cursor.fetchone()[0]
+        print(f"total restaurants: {restaurant_count}")
+
+        # get review count
+        cursor.execute("SELECT COUNT(*) FROM reviews")
+        review_count = cursor.fetchone()[0]
+        print(f"total reviews: {review_count}")
+
+        # get most popular taco types
+        cursor.execute("""
+        SELECT best_taco, COUNT(*) as count
+        FROM taco_restaurants
+        WHERE best_taco IS NOT NULL AND best_taco != ''
+        GROUP BY best_taco
+        ORDER BY count DESC
+        LIMIT 10
+        """)
+        popular_tacos = cursor.fetchall()
+
+        if popular_tacos:
+            print("\nmost popular taco types:")
+            for taco, count in popular_tacos:
+                print(f"  {taco}: {count} restaurants")
+
+        # get top restaurant chains by number of locations
+        cursor.execute("""
+        SELECT name, COUNT(*) as count
+        FROM taco_restaurants
+        GROUP BY name
+        HAVING count > 1
+        ORDER BY count DESC
+        LIMIT 10
+        """)
+        restaurant_chains = cursor.fetchall()
+
+        if restaurant_chains:
+            print("\ntop restaurant chains by locations:")
+            for name, count in restaurant_chains:
+                print(f"  {name}: {count} locations")
+
+        # extract zip codes and count restaurants per zip
+        print("\nrestaurants by zip code:")
+        cursor.execute("SELECT address FROM taco_restaurants")
+        addresses = cursor.fetchall()
+
+        zip_counts = {}
+        for (address,) in addresses:
+            if address:
+                # try to extract zip code from address
+                # assuming format like "123 Main St, City, State 12345" or similar
+                parts = address.split()
+                for part in parts:
+                    # look for 5-digit zip codes
+                    if part.isdigit() and len(part) == 5:
+                        zip_code = part
+                        zip_counts[zip_code] = zip_counts.get(zip_code, 0) + 1
+                        break
+
+        # display zip code stats
+        if zip_counts:
+            # sort by count (descending) and filter out single-restaurant zips
+            sorted_zips = sorted(zip_counts.items(), key=lambda x: x[1], reverse=True)
+            filtered_zips = [(zip_code, count) for zip_code, count in sorted_zips if count > 1]
+
+            if filtered_zips:
+                for zip_code, count in filtered_zips:
+                    print(f"  zip {zip_code}: {count} restaurants")
+            else:
+                print("  no zip codes with multiple restaurants found")
+        else:
+            print("  no zip codes found in addresses")
+
+        conn.close()
+    except Exception as e:
+        print(f"error generating stats: {e}")
+
 def parse_arguments():
     """
     parse command line arguments.
@@ -153,12 +245,15 @@ def parse_arguments():
     """
     parser = argparse.ArgumentParser(description="view taco restaurants database")
     parser.add_argument("--id", help="view specific restaurant by id")
+    parser.add_argument("--stats", action="store_true", help="display statistics about restaurants and reviews")
     return parser.parse_args()
 
 def main():
     args = parse_arguments()
 
-    if args.id:
+    if args.stats:
+        display_stats(DB_PATH)
+    elif args.id:
         view_restaurant_by_id(DB_PATH, args.id)
     else:
         view_all_restaurants(DB_PATH)
