@@ -198,27 +198,30 @@ def insert_reviews(db_path: str, restaurant_id: str, reviews: list):
         return
 
     try:
+        # first, let's debug what we're getting
+        if DEBUG:
+            logging.debug(f"inserting {len(reviews)} reviews for restaurant {restaurant_id}")
+            if reviews and isinstance(reviews[0], dict):
+                logging.debug(f"review sample: {list(reviews[0].keys())}")
+                logging.debug(f"first review: {reviews[0]}")
+            else:
+                logging.debug(f"review type: {type(reviews[0])}")
+
         conn = sqlite3.connect(db_path)
         cursor = conn.cursor()
 
         # check if we need to migrate the reviews table to add unique constraint
-        cursor.execute("PRAGMA table_info(reviews)")
-        columns = cursor.fetchall()
         has_unique_constraint = False
 
-        # check if the table has a unique index on text only
+        # check if the table has a unique index on text
         cursor.execute("PRAGMA index_list(reviews)")
         indexes = cursor.fetchall()
+
+        # simplified check for unique constraint on text column
         for idx in indexes:
-            cursor.execute(f"PRAGMA index_info({idx[1]})")
-            index_columns = cursor.fetchall()
-            # check if this index has the text column only
-            for col in index_columns:
-                col_name = columns[col[2]][1]
-                if col_name == 'text':
-                    has_unique_constraint = True
-                    break
-            if has_unique_constraint:
+            index_name = idx[1]
+            if 'text' in index_name or index_name == 'idx_reviews_text':
+                has_unique_constraint = True
                 break
 
         # if no unique constraint exists, create one
@@ -237,23 +240,58 @@ def insert_reviews(db_path: str, restaurant_id: str, reviews: list):
                     logging.debug(f"error creating unique index: {e}")
 
         # insert reviews using INSERT OR IGNORE to skip duplicates
-        for review in reviews:
-            text = review.get("text", "")
-            rating = review.get("rating", None)
-            time_created = review.get("time_created", None)
+        inserted_count = 0
+        for i, review in enumerate(reviews):
+            try:
+                # ensure review is a dictionary
+                if not isinstance(review, dict):
+                    if DEBUG:
+                        logging.debug(f"skipping non-dict review at index {i}: {type(review)}")
+                    continue
 
-            cursor.execute('''
-            INSERT OR IGNORE INTO reviews (restaurant_id, text, rating, date)
-            VALUES (?, ?, ?, ?)
-            ''', (restaurant_id, text, rating, time_created))
+                # extract fields with safe fallbacks
+                text = review.get("text", "")
+                if not text:  # skip empty reviews
+                    continue
+
+                rating = review.get("rating")
+                if rating is not None:
+                    try:
+                        rating = float(rating)
+                    except (ValueError, TypeError):
+                        rating = None
+
+                time_created = review.get("time_created")
+
+                # insert with proper error handling
+                cursor.execute('''
+                INSERT OR IGNORE INTO reviews (restaurant_id, text, rating, date)
+                VALUES (?, ?, ?, ?)
+                ''', (restaurant_id, text, rating, time_created))
+
+                if cursor.rowcount > 0:
+                    inserted_count += 1
+            except Exception as e:
+                if DEBUG:
+                    logging.debug(f"error inserting review at index {i}: {e}")
+                    if isinstance(review, dict):
+                        logging.debug(f"review keys: {list(review.keys())}")
+                        for key, value in review.items():
+                            logging.debug(f"  {key}: {type(value)}")
+                    else:
+                        logging.debug(f"review type: {type(review)}")
 
         conn.commit()
         conn.close()
 
         if DEBUG:
-            logging.debug(f"inserted {len(reviews)} reviews for restaurant {restaurant_id}")
+            logging.debug(f"inserted {inserted_count} reviews for restaurant {restaurant_id}")
     except Exception as e:
         print(f"error inserting reviews into database: {e}")
+        if DEBUG:
+            import traceback
+            logging.debug(f"full error inserting reviews: {e}")
+            logging.debug(f"traceback: {traceback.format_exc()}")
 
 
 def yelp_search_taco_restaurants(location: str, term: str, offset: int = 0) -> dict:
@@ -446,61 +484,47 @@ def query_best_taco(restaurant_name: str, reviews_snippet: str) -> str:
 
 def get_top_review_snippets(business_id: str, limit: int = 3) -> tuple:
     """
-    yelp fusion reviews endpoint: fetch up to `limit` reviews for the given business_id.
-    makes multiple requests with different offsets to get more reviews if needed.
+    yelp fusion reviews endpoint: fetch reviews for the given business_id.
     returns a tuple of (review_objects, concatenated_text).
     if reviews are unavailable or error occurs, return ([], "").
 
     note: the yelp api deliberately truncates review text with "..." - this is a
     limitation of the api and cannot be bypassed without violating yelp's terms of service.
+
+    note: yelp api seems to return the same reviews regardless of offset, so we only fetch the first batch.
     """
     try:
         headers = {"Authorization": f"Bearer {YELP_API_KEY}"}
         url = f"{YELP_BUSINESS_ENDPOINT}{business_id}/reviews"
 
-        # yelp api seems to have a max of 3 reviews per request
-        # so we need to make multiple requests with different offsets
+        # just get the first batch of reviews (max 3)
         all_reviews = []
-        max_reviews_per_request = 3
-        offset = 0
-        more_reviews = True
 
         if DEBUG:
             logging.debug(f"fetching up to {limit} reviews for business id: {business_id}")
 
-        while more_reviews:
-            current_limit = max_reviews_per_request
-            # try to get full review text
-            # use the best parameters to get maximum review text (though still truncated by Yelp)
-            params = {
-                "limit": current_limit,
-                "offset": offset,
-                "text_format": "original",  # request original text format
-                "sort_by": "relevance"      # get most relevant reviews first
-            }
+        # try to get full review text
+        # use the best parameters to get maximum review text (though still truncated by Yelp)
+        params = {
+            "limit": limit,
+            "offset": 0,
+            "text_format": "original",  # request original text format
+            "sort_by": "relevance"      # get most relevant reviews first
+        }
 
-            if DEBUG:
-                logging.debug(f"fetching reviews batch: offset={offset}, limit={current_limit}")
+        if DEBUG:
+            logging.debug(f"fetching reviews batch: offset=0, limit={limit}")
 
-            response = requests.get(url, headers=headers, params=params)
-            response.raise_for_status()
-            data = response.json()
-            reviews = data.get("reviews", [])
-            all_reviews.extend(reviews)
+        response = requests.get(url, headers=headers, params=params)
+        response.raise_for_status()
+        data = response.json()
+        reviews = data.get("reviews", [])
 
-            if len(reviews) < current_limit:
-                # no more reviews available
-                more_reviews = False
-            else:
-                offset += max_reviews_per_request
+        # add reviews to our collection
+        all_reviews.extend(reviews)
 
-                # stop if we've reached the specified limit
-                if len(all_reviews) >= limit:
-                    more_reviews = False
-                    all_reviews = all_reviews[:limit]  # trim to exact limit if needed
-
-            # avoid hitting rate limits
-            time.sleep(0.2)
+        # avoid hitting rate limits
+        time.sleep(0.2)
 
         if DEBUG:
             review_count = len(all_reviews)
@@ -636,16 +660,18 @@ def main():
 
             # 3) fetch reviews and ask llm for best taco
             # note: yelp api will truncate review text with "..." - this is their api limitation
-            reviews, review_snips = get_top_review_snippets(biz_id, limit=25)
+            reviews, review_snips = get_top_review_snippets(biz_id, limit=3)
             best_taco = "Unknown"
             if review_snips:
                 best_taco = query_best_taco(name, review_snips)
 
             # store reviews in database
             if reviews:
-                insert_reviews(DB_PATH, biz_id, reviews)
-                if DEBUG:
-                    logging.debug(f"saved {len(reviews)} reviews for restaurant {name}")
+                try:
+                    insert_reviews(DB_PATH, biz_id, reviews)
+                except Exception as e:
+                    if DEBUG:
+                        logging.debug(f"error in main when inserting reviews: {e}")
 
             # 4) insert this restaurant into database immediately
             restaurant = (biz_id, name, address, hours, best_taco)
