@@ -1,0 +1,611 @@
+import os
+import time
+import requests
+import pandas as pd
+import argparse
+import logging
+import json
+import sqlite3
+from openai import OpenAI
+
+# ─── CONFIGURATION ────────────────────────────────────────────────────────────
+# 0) llm provider toggle
+USE_OPENROUTER = True  # set to false to use openai directly
+
+# 1) yelp fusion api
+YELP_API_KEY = os.getenv("YELP_API_KEY")
+YELP_SEARCH_ENDPOINT = "https://api.yelp.com/v3/businesses/search"
+YELP_BUSINESS_ENDPOINT = "https://api.yelp.com/v3/businesses/"
+
+# 2) openai api
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+# 3) openrouter api
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "sk-or-v1-...")
+OPENROUTER_API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+# 3) sqlite database where we store processed taco restaurants
+DB_PATH = "taco_restaurants.db"
+OFFSET_FILE = "last_offset.txt"  # file to store the last used offset
+
+# 4) search parameters
+LOCATION = "Austin, TX"
+TERM = "taco"
+LIMIT_PER_PAGE = 50  # max yelp allows is 50
+
+
+# ─── HELPERS ────────────────────────────────────────────────────────────────────
+def get_last_offset() -> int:
+    """
+    read the last used offset from file.
+    returns 0 if file doesn't exist or can't be read.
+    """
+    try:
+        if os.path.exists(OFFSET_FILE):
+            with open(OFFSET_FILE, "r") as f:
+                return int(f.read().strip())
+        return 0
+    except Exception as e:
+        if DEBUG:
+            logging.debug(f"error reading last offset: {e}")
+        return 0
+
+
+def save_last_offset(offset: int):
+    """
+    save the current offset to file for next run.
+    """
+    try:
+        with open(OFFSET_FILE, "w") as f:
+            f.write(str(offset))
+        if DEBUG:
+            logging.debug(f"saved offset {offset} for next run")
+    except Exception as e:
+        if DEBUG:
+            logging.debug(f"error saving offset: {e}")
+
+
+def init_database(db_path: str):
+    """
+    initialize the sqlite database if it doesn't exist.
+    creates the taco_restaurants table and reviews table with required columns.
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # create restaurants table if it doesn't exist
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS taco_restaurants (
+        id TEXT PRIMARY KEY,
+        name TEXT,
+        address TEXT,
+        hours TEXT,
+        best_taco TEXT
+    )
+    ''')
+
+    # create reviews table if it doesn't exist
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS reviews (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        restaurant_id TEXT NOT NULL,
+        text TEXT NOT NULL,
+        rating REAL,
+        date TEXT,
+        FOREIGN KEY (restaurant_id) REFERENCES taco_restaurants(id)
+    )
+    ''')
+
+    conn.commit()
+    conn.close()
+
+    if DEBUG:
+        logging.debug(f"database initialized at: {db_path}")
+
+
+def load_existing_restaurants(db_path: str) -> set:
+    """
+    load existing restaurant ids (yelp business ids) from database.
+    returns a set of business ids (strings).
+    if the database does not exist, returns an empty set.
+    handles potential errors when reading from the database.
+    """
+    if not os.path.isfile(db_path):
+        init_database(db_path)
+        return set()
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM taco_restaurants")
+        ids = cursor.fetchall()
+        conn.close()
+
+        # convert list of tuples to set of strings
+        return set(id_tuple[0] for id_tuple in ids)
+    except Exception as e:
+        print(f"error reading database {db_path}: {e}")
+        return set()
+
+
+def insert_restaurant(db_path: str, restaurant: tuple):
+    """
+    insert a restaurant record into the database.
+    restaurant is a tuple of (id, name, address, hours, best_taco).
+    """
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        cursor.execute('''
+        INSERT INTO taco_restaurants (id, name, address, hours, best_taco)
+        VALUES (?, ?, ?, ?, ?)
+        ''', restaurant)
+
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"error inserting restaurant into database: {e}")
+
+
+def insert_reviews(db_path: str, restaurant_id: str, reviews: list):
+    """
+    insert multiple review records into the database.
+    reviews is a list of review objects from the yelp api.
+    """
+    if not reviews:
+        return
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+
+        for review in reviews:
+            text = review.get("text", "")
+            rating = review.get("rating", None)
+            time_created = review.get("time_created", None)
+
+            cursor.execute('''
+            INSERT INTO reviews (restaurant_id, text, rating, date)
+            VALUES (?, ?, ?, ?)
+            ''', (restaurant_id, text, rating, time_created))
+
+        conn.commit()
+        conn.close()
+
+        if DEBUG:
+            logging.debug(f"inserted {len(reviews)} reviews for restaurant {restaurant_id}")
+    except Exception as e:
+        print(f"error inserting reviews into database: {e}")
+
+
+def yelp_search_taco_restaurants(location: str, term: str, offset: int = 0) -> dict:
+    """
+    call yelp fusion search api to find taco restaurants.
+    returns the json response.
+    """
+    headers = {"Authorization": f"Bearer {YELP_API_KEY}"}
+    params = {
+        "term": term,
+        "location": location,
+        "limit": LIMIT_PER_PAGE,
+        "offset": offset,
+        "categories": "tacos",  # restrict to taco category
+    }
+
+    if DEBUG:
+        logging.debug(f"calling yelp search api with params: {params}")
+
+    response = requests.get(YELP_SEARCH_ENDPOINT, headers=headers, params=params)
+    response.raise_for_status()
+    result = response.json()
+
+    if DEBUG:
+        total_results = result.get("total", 0)
+        businesses_count = len(result.get("businesses", []))
+        logging.debug(f"yelp search returned {businesses_count} businesses (total available: {total_results})")
+
+    return result
+
+
+def yelp_get_business_details(business_id: str) -> dict:
+    """
+    call yelp fusion business api to fetch detailed info (including hours).
+    """
+    headers = {"Authorization": f"Bearer {YELP_API_KEY}"}
+    url = f"{YELP_BUSINESS_ENDPOINT}{business_id}"
+
+    if DEBUG:
+        logging.debug(f"fetching business details for id: {business_id}")
+
+    response = requests.get(url, headers=headers)
+    response.raise_for_status()
+    result = response.json()
+
+    if DEBUG:
+        hours_info = result.get("hours", [])
+        has_hours = len(hours_info) > 0
+        logging.debug(f"business details for {business_id}: name={result.get('name')}, has_hours={has_hours}")
+
+    return result
+
+
+def parse_hours_to_json(hours_str: str) -> str:
+    """
+    parse hours string in format "day hh:mm-hh:mm; day hh:mm-hh:mm" to json.
+    returns a json string with days as keys and time ranges as values.
+    days without hours will have null value.
+    """
+    if hours_str == "N/A":
+        return json.dumps({day: None for day in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]})
+
+    # initialize all days with null
+    hours_dict = {day: None for day in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]}
+
+    # parse each day's hours
+    day_hours = hours_str.split("; ")
+    for entry in day_hours:
+        parts = entry.split(" ")
+        if len(parts) == 2:
+            day = parts[0]
+            time_range = parts[1]
+            hours_dict[day] = time_range
+
+    return json.dumps(hours_dict)
+
+
+def extract_hours_from_yelp(business_json: dict) -> str:
+    """
+    given a business detail json, extract the hours in json format.
+    keys are days of week, values are time ranges or null if closed.
+    fallback to json with all null values if hours not available.
+    """
+    hours_info = business_json.get("hours", [])
+    if not hours_info:
+        return json.dumps({day: None for day in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]})
+
+    # usually hours_info is a list with one element containing 'open' array
+    open_sections = hours_info[0].get("open", [])
+    day_map = {
+        0: "Mon", 1: "Tue", 2: "Wed", 3: "Thu", 4: "Fri", 5: "Sat", 6: "Sun"
+    }
+
+    # initialize all days with null
+    hours_dict = {day: None for day in ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]}
+
+    # populate hours for each day
+    for entry in open_sections:
+        day = day_map.get(entry.get("day"), "Unknown")
+        start = entry.get("start")  # e.g. "1100"
+        end = entry.get("end")      # e.g. "2200"
+        # convert "1100" → "11:00", etc.
+        formatted_start = f"{start[:2]}:{start[2:]}"
+        formatted_end = f"{end[:2]}:{end[2:]}"
+        hours_dict[day] = f"{formatted_start}-{formatted_end}"
+
+    return json.dumps(hours_dict)
+
+
+def query_openrouter(prompt: str) -> str:
+    """
+    query the openrouter api with the given prompt.
+    returns the generated text response.
+    handles errors and returns "unknown" on failure.
+    """
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://github.com/yelp-taco-enumerator"
+    }
+
+    payload = {
+        "model": "anthropic/claude-3-haiku",  # using a fast, cost-effective model
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.7,
+        "max_tokens": 50
+    }
+
+    try:
+        response = requests.post(
+            OPENROUTER_API_URL,
+            headers=headers,
+            data=json.dumps(payload)
+        )
+        response.raise_for_status()
+        result = response.json()
+        text = result["choices"][0]["message"]["content"].strip()
+        return text.strip().strip('"').strip("'")
+    except Exception as e:
+        if DEBUG:
+            logging.debug(f"openrouter request failed: {e}")
+        return "Unknown"
+
+
+def query_best_taco(restaurant_name: str, reviews_snippet: str) -> str:
+    """
+    ask an llm to determine the "best taco" based on provided review snippets.
+    we send a prompt with the restaurant name and a few reviews; the model returns a short string.
+    if it cannot determine, return "unknown".
+    uses either openrouter or openai based on the global toggle.
+    """
+    prompt = (
+        f"You are a food critic AI. Given the restaurant '{restaurant_name}' and the following "
+        f"recent Yelp review snippets about their tacos:\n\n"
+        f"{reviews_snippet}\n\n"
+        "Which specific taco item seems to be the most highly praised? "
+        "Answer with the taco name only (e.g., \"Al Pastor Taco\"). "
+        "If you cannot tell from these snippets, just say 'Unknown'."
+        "Your response should be only the name of the taco, without any additional text."
+        "Your response should be short, not a complete sentence, just the name of the taco."
+    )
+
+    if DEBUG:
+        logging.debug(f"prompt for restaurant '{restaurant_name}':")
+        logging.debug(f"---prompt start---")
+        logging.debug(f"{prompt}")
+        logging.debug(f"---prompt end---")
+
+    if USE_OPENROUTER:
+        if DEBUG:
+            logging.debug(f"using openrouter for restaurant: {restaurant_name}")
+        return query_openrouter(prompt)
+    else:
+        if DEBUG:
+            logging.debug(f"using openai for restaurant: {restaurant_name}")
+        try:
+            resp = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7,
+                max_tokens=50,
+            )
+            text = resp.choices[0].message.content.strip()
+            # sometimes the model will preface with quotes; strip them.
+            return text.strip().strip('"').strip("'")
+        except Exception as e:
+            print(f"llm request failed for {restaurant_name}: {e}")
+            return "Unknown"
+
+
+def get_top_review_snippets(business_id: str, limit: int = 3) -> tuple:
+    """
+    yelp fusion reviews endpoint: fetch up to `limit` reviews for the given business_id.
+    makes multiple requests with different offsets to get more reviews if needed.
+    returns a tuple of (review_objects, concatenated_text).
+    if reviews are unavailable or error occurs, return ([], "").
+
+    note: the yelp api deliberately truncates review text with "..." - this is a
+    limitation of the api and cannot be bypassed without violating yelp's terms of service.
+    """
+    try:
+        headers = {"Authorization": f"Bearer {YELP_API_KEY}"}
+        url = f"{YELP_BUSINESS_ENDPOINT}{business_id}/reviews"
+
+        # yelp api seems to have a max of 3 reviews per request
+        # so we need to make multiple requests with different offsets
+        all_reviews = []
+        max_reviews_per_request = 3
+        offset = 0
+        more_reviews = True
+
+        if DEBUG:
+            logging.debug(f"fetching up to {limit} reviews for business id: {business_id}")
+
+        while more_reviews:
+            current_limit = max_reviews_per_request
+            # try to get full review text
+            # use the best parameters to get maximum review text (though still truncated by Yelp)
+            params = {
+                "limit": current_limit,
+                "offset": offset,
+                "text_format": "original",  # request original text format
+                "sort_by": "relevance"      # get most relevant reviews first
+            }
+
+            if DEBUG:
+                logging.debug(f"fetching reviews batch: offset={offset}, limit={current_limit}")
+
+            response = requests.get(url, headers=headers, params=params)
+            response.raise_for_status()
+            data = response.json()
+            reviews = data.get("reviews", [])
+            all_reviews.extend(reviews)
+
+            if len(reviews) < current_limit:
+                # no more reviews available
+                more_reviews = False
+            else:
+                offset += max_reviews_per_request
+
+                # stop if we've reached the specified limit
+                if len(all_reviews) >= limit:
+                    more_reviews = False
+                    all_reviews = all_reviews[:limit]  # trim to exact limit if needed
+
+            # avoid hitting rate limits
+            time.sleep(0.2)
+
+        if DEBUG:
+            review_count = len(all_reviews)
+            avg_length = sum(len(rev.get("text", "")) for rev in all_reviews) // max(1, review_count)
+            logging.debug(f"received total of {review_count} reviews for {business_id}, avg length: {avg_length} chars")
+
+        # Note: Yelp API deliberately truncates review text with "..."
+        # This is a limitation of the API and cannot be bypassed
+        if DEBUG and any(rev.get("text", "").endswith("...") for rev in all_reviews):
+            logging.debug("Some reviews are truncated due to Yelp API limitations")
+
+        snippets = [rev.get("text", "") for rev in all_reviews]
+        joined_snippets = "\n\n".join(snippets)
+
+        if DEBUG:
+            logging.debug(f"review snippets for business {business_id}:")
+            logging.debug(f"---snippets start---")
+            logging.debug(f"{joined_snippets}")
+            logging.debug(f"---snippets end---")
+
+        return all_reviews, joined_snippets
+    except Exception as e:
+        error_msg = f"failed to fetch reviews for {business_id}: {e}"
+        if DEBUG:
+            logging.debug(error_msg)
+        else:
+            print(error_msg)
+        return [], ""
+
+
+def setup_logging(debug_mode: bool):
+    """
+    configure logging based on debug mode.
+    sets up console handler with appropriate format and level.
+    """
+    global DEBUG
+    DEBUG = debug_mode
+
+    if debug_mode:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format='%(asctime)s [DEBUG] %(message)s',
+            datefmt='%H:%M:%S'
+        )
+        logging.debug("debug mode enabled")
+    else:
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(message)s'
+        )
+
+
+def parse_arguments():
+    """
+    parse command line arguments.
+    returns the parsed arguments object.
+    """
+    parser = argparse.ArgumentParser(description="yelp taco restaurant finder")
+    parser.add_argument("--debug", action="store_true", help="enable debug logging")
+    return parser.parse_args()
+
+
+def get_restaurant_count(db_path: str) -> int:
+    """
+    get the total count of restaurants in the database.
+    returns 0 if the database doesn't exist or an error occurs.
+    """
+    if not os.path.isfile(db_path):
+        return 0
+
+    try:
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM taco_restaurants")
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+    except Exception as e:
+        print(f"error counting restaurants in database: {e}")
+        return 0
+
+
+# ─── MAIN LOGIC ────────────────────────────────────────────────────────────────
+def main():
+    # parse command line arguments
+    args = parse_arguments()
+
+    # setup logging based on debug flag
+    setup_logging(args.debug)
+
+    # 1) ensure database exists and load existing ids
+    init_database(DB_PATH)
+    existing_ids = load_existing_restaurants(DB_PATH)
+
+    # get the last used offset to start from there
+    offset = get_last_offset()
+
+    if DEBUG:
+        logging.debug(f"starting search for '{TERM}' in '{LOCATION}'")
+        logging.debug(f"using limit of {LIMIT_PER_PAGE} results per page")
+        logging.debug(f"starting from offset: {offset}")
+
+    print(f"found {len(existing_ids)} existing restaurants in the database")
+    print(f"starting from offset: {offset}")
+    restaurants_processed = 0
+
+    total_api_calls = 0
+    while True:
+        total_api_calls += 1
+        if DEBUG:
+            logging.debug(f"search iteration {total_api_calls}, offset: {offset}")
+
+        data = yelp_search_taco_restaurants(LOCATION, TERM, offset=offset)
+        businesses = data.get("businesses", [])
+
+        if not businesses:
+            if DEBUG:
+                logging.debug("no more businesses returned, ending search")
+            break
+
+        for biz in businesses:
+            biz_id = biz.get("id")
+            if not biz_id or biz_id in existing_ids:
+                continue  # skip if already processed or no id
+
+            name = biz.get("name", "")
+            location = biz.get("location", {})
+            address = ", ".join(location.get("display_address", []))
+
+            # 2) fetch business details (hours)
+            details = yelp_get_business_details(biz_id)
+            hours = extract_hours_from_yelp(details)
+
+            # 3) fetch reviews and ask llm for best taco
+            # note: yelp api will truncate review text with "..." - this is their api limitation
+            reviews, review_snips = get_top_review_snippets(biz_id, limit=25)
+            best_taco = "Unknown"
+            if review_snips:
+                best_taco = query_best_taco(name, review_snips)
+
+            # store reviews in database
+            if reviews:
+                insert_reviews(DB_PATH, biz_id, reviews)
+                if DEBUG:
+                    logging.debug(f"saved {len(reviews)} reviews for restaurant {name}")
+
+            # 4) insert this restaurant into database immediately
+            restaurant = (biz_id, name, address, hours, best_taco)
+            insert_restaurant(DB_PATH, restaurant)
+            restaurants_processed += 1
+            print(f"→ processed & saved: {name} ({biz_id})")
+
+            # to avoid hitting rate limits—pause briefly
+            time.sleep(0.5)
+
+        # yelp allows up to ~1000 results in increments of 50
+        offset += LIMIT_PER_PAGE
+
+        # save current offset for next run
+        save_last_offset(offset)
+
+        # if we've reached the end, wrap around to 0 for next run
+        if offset >= data.get("total", 0) or offset >= 1000:
+            save_last_offset(0)
+            break
+
+    # summary of processing
+    if restaurants_processed > 0:
+        print(f"successfully processed and saved {restaurants_processed} new restaurants to {DB_PATH}")
+    else:
+        print("no new taco restaurants found.")
+
+    total_count = get_restaurant_count(DB_PATH)
+    print(f"total restaurants in database: {total_count}")
+
+    if DEBUG:
+        logging.debug(f"script completed: made {total_api_calls} search api calls")
+        logging.debug(f"processed {restaurants_processed} new restaurants")
+
+
+if __name__ == "__main__":
+    # before running:
+    # • set environment variables: YELP_API_KEY and either OPENAI_API_KEY or OPENROUTER_API_KEY
+    # • pip install requests pandas openai>=1.0.0 sqlite3
+    main()
