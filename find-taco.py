@@ -298,6 +298,7 @@ def yelp_search_taco_restaurants(location: str, term: str, offset: int = 0) -> d
     """
     call yelp fusion search api to find taco restaurants.
     returns the json response.
+    handles 400 errors which may occur when offset exceeds api limits.
     """
     headers = {"Authorization": f"Bearer {YELP_API_KEY}"}
     params = {
@@ -311,16 +312,25 @@ def yelp_search_taco_restaurants(location: str, term: str, offset: int = 0) -> d
     if DEBUG:
         logging.debug(f"calling yelp search api with params: {params}")
 
-    response = requests.get(YELP_SEARCH_ENDPOINT, headers=headers, params=params)
-    response.raise_for_status()
-    result = response.json()
+    try:
+        response = requests.get(YELP_SEARCH_ENDPOINT, headers=headers, params=params)
+        response.raise_for_status()
+        result = response.json()
 
-    if DEBUG:
-        total_results = result.get("total", 0)
-        businesses_count = len(result.get("businesses", []))
-        logging.debug(f"yelp search returned {businesses_count} businesses (total available: {total_results})")
+        if DEBUG:
+            total_results = result.get("total", 0)
+            businesses_count = len(result.get("businesses", []))
+            logging.debug(f"yelp search returned {businesses_count} businesses (total available: {total_results})")
 
-    return result
+        return result
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 400:
+            if DEBUG:
+                logging.debug(f"yelp api rejected request with offset={offset}, likely exceeded maximum allowed offset")
+            # return empty result to signal end of pagination
+            return {"businesses": [], "total": 0}
+        # re-raise other http errors
+        raise
 
 
 def yelp_get_business_details(business_id: str) -> dict:
@@ -688,8 +698,8 @@ def main():
         # save current offset for next run
         save_last_offset(DB_PATH, offset)
 
-        # if we've reached the end, wrap around to 0 for next run
-        if offset >= data.get("total", 0) or offset >= 1000:
+        # if we've reached the end or hit yelp's offset limit (which appears to be ~200), wrap around to 0 for next run
+        if offset >= data.get("total", 0) or offset >= 200:
             save_last_offset(DB_PATH, 0)
             break
 
